@@ -1,13 +1,7 @@
-"""
-engine/pipeline.py — Stub pipeline for web app.
-Replace with real engine code later.
-"""
-
 import re
 import random
 
-
-def build_baseline(corpus_text: str) -> dict:
+def build_baseline(corpus_text):
     words = corpus_text.split()
     word_count = len(words)
     sentences = [s.strip() for s in re.split(r'[.!?]+', corpus_text) if s.strip()]
@@ -36,20 +30,14 @@ def build_baseline(corpus_text: str) -> dict:
         "corpus_word_count": word_count
     }
 
-
-def produce_chapter(bible_text: str, baseline_metrics: dict,
-                    chapter_beats: str, scene_type: str,
-                    config: dict = None) -> dict:
-    chapter_text = f"[STUB — Replace engine/pipeline.py with real pipeline]\n\nChapter beats:\n{chapter_beats}\n\nScene type: {scene_type}"
+def produce_chapter(bible_text, baseline_metrics, chapter_beats, scene_type, config=None):
+    chapter_text = "[STUB] Replace engine/pipeline.py with real pipeline.\n\nBeats:\n" + chapter_beats + "\n\nScene: " + scene_type
     return {
         "chapter_text": chapter_text,
         "word_count": len(chapter_text.split()),
         "quality_score": 0,
         "quality_report": {"total_score": 0, "checks": ["stub"]},
-        "voice_delta": {
-            m: {"baseline": v, "chapter": 0, "severity": "stub"}
-            for m, v in baseline_metrics.items()
-        },
+        "voice_delta": {m: {"baseline": v, "chapter": 0, "severity": "stub"} for m, v in baseline_metrics.items()},
         "hotspots": [],
         "manifest": {"pipeline_version": "stub", "scene_type": scene_type},
         "api_usage": {"input_tokens": 0, "output_tokens": 0, "cost": 0.0}
