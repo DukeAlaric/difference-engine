@@ -2,16 +2,14 @@
 engine/pipeline.py — Full production pipeline for the Difference Engine web app.
 
 Stages:
-  1. Baseline analysis (14 metrics)
   2. Draft generation (Claude API)
   3. Corrective rewrite (Claude API)
-  4. Post-processing:
-     4.1 Em-dash mechanical removal
-     4.2 Smoothing word mechanical removal
-     4.3 Opener fix (reduce name-opener percentage)
-     4.4 Impact paragraph isolation
+  4.1 Em-dash mechanical removal
+  4.2 Smoothing word mechanical removal
+  4.3 Opener fix
+  4.4 Impact paragraph isolation
   5. Quality gate (full scoring)
-  6. Voice delta with z-scores
+  6. Voice delta (style-rule-aware)
 """
 
 import re
@@ -20,16 +18,55 @@ import anthropic
 import streamlit as st
 
 
-# ---------------------------------------------------------------------------
-# Anthropic client
-# ---------------------------------------------------------------------------
-
 def get_anthropic_client():
     return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 
 # ---------------------------------------------------------------------------
-# STAGE 1: Baseline Analysis
+# Style rules that override baseline comparison
+# When the bible says "no em-dashes," zero is compliance, not drift.
+# ---------------------------------------------------------------------------
+
+STYLE_OVERRIDES = {
+    "em_dash_per_1k": 0,       # Bible says NONE
+    "semicolon_per_1k": 0,     # Bible says no
+    "smoothing_per_1k": 0,     # We actively remove these
+}
+
+# Metrics that are meaningless when there's no dialogue in the chapter
+DIALOGUE_DEPENDENT_METRICS = {"said_ratio_pct", "dialogue_ratio_pct"}
+
+SMOOTHING_WORDS = [
+    'however', 'moreover', 'furthermore', 'nevertheless', 'nonetheless',
+    'consequently', 'therefore', 'indeed', 'certainly', 'naturally',
+    'obviously', 'of course', 'in fact', 'as a matter of fact',
+    'it is worth noting', 'it should be noted', 'needless to say'
+]
+
+SCENE_TYPE_DIALOGUE_TARGETS = {
+    "reflective": (0, 15),
+    "social_confrontation": (45, 85),
+    "action": (0, 40),
+    "intimate": (30, 65),
+    "procedural": (5, 30),
+}
+
+NON_ADVERBS = {'only', 'early', 'family', 'likely', 'belly', 'holy', 'ugly',
+               'lonely', 'friendly', 'elderly', 'daily', 'july', 'fly', 'reply',
+               'supply', 'ally', 'apply', 'rely', 'sally', 'billy', 'molly',
+               'emily', 'lily', 'fully', 'really', 'finally'}
+
+COMMON_STARTERS = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
+                   'this', 'that', 'there', 'when', 'where', 'what', 'how',
+                   'but', 'and', 'so', 'if', 'as', 'in', 'on', 'at', 'for',
+                   'to', 'his', 'her', 'my', 'our', 'its', 'no', 'not', 'all',
+                   'one', 'two', 'some', 'any', 'every', 'each', 'after',
+                   'before', 'now', 'then', 'just', 'even', 'still', 'with',
+                   'from', 'by', 'up', 'out', 'down', 'back', 'over', 'through'}
+
+
+# ---------------------------------------------------------------------------
+# STAGE 1: Baseline
 # ---------------------------------------------------------------------------
 
 def build_baseline(corpus_text):
@@ -44,30 +81,17 @@ def build_baseline(corpus_text):
     em_dashes = corpus_text.count('\u2014') + corpus_text.count('--')
     dialogue_lines = len(re.findall(r'"[^"]*"', corpus_text))
 
-    # Sentence length stdev
     lengths = [len(s.split()) for s in sentences]
     mean_len = sum(lengths) / max(len(lengths), 1)
     variance = sum((l - mean_len) ** 2 for l in lengths) / max(len(lengths), 1)
     stdev = variance ** 0.5
 
-    # Adverbs (words ending in -ly, excluding common non-adverbs)
-    non_adverbs = {'only', 'early', 'family', 'likely', 'belly', 'holy', 'ugly',
-                   'lonely', 'friendly', 'elderly', 'daily', 'july', 'fly', 'reply',
-                   'supply', 'ally', 'apply', 'rely', 'italy', 'sally', 'billy',
-                   'molly', 'emily', 'lily'}
     adverbs = sum(1 for w in words if w.lower().endswith('ly') and len(w) > 3
-                  and w.lower() not in non_adverbs)
+                  and w.lower() not in NON_ADVERBS)
 
-    # Smoothing words
-    smoothing_list = ['however', 'moreover', 'furthermore', 'nevertheless',
-                      'nonetheless', 'meanwhile', 'consequently', 'therefore',
-                      'indeed', 'certainly', 'naturally', 'obviously',
-                      'of course', 'in fact', 'as a matter of fact',
-                      'it is worth noting', 'it should be noted']
     text_lower = corpus_text.lower()
-    smoothing_count = sum(text_lower.count(w) for w in smoothing_list)
+    smoothing_count = sum(text_lower.count(w) for w in SMOOTHING_WORDS)
 
-    # Said ratio
     all_tags = re.findall(
         r'\b(said|asked|replied|whispered|shouted|muttered|called|cried|answered|'
         r'growled|hissed|exclaimed|declared|snapped|barked|sighed|groaned)\b',
@@ -75,25 +99,15 @@ def build_baseline(corpus_text):
     said_count = sum(1 for t in all_tags if t.lower() == 'said')
     said_ratio = (said_count / max(len(all_tags), 1)) * 100
 
-    # Name openers
-    common_starters = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
-                       'this', 'that', 'there', 'when', 'where', 'what', 'how',
-                       'but', 'and', 'so', 'if', 'as', 'in', 'on', 'at', 'for',
-                       'to', 'his', 'her', 'my', 'our', 'its', 'no', 'not', 'all',
-                       'one', 'two', 'some', 'any', 'every', 'each', 'after',
-                       'before', 'now', 'then', 'just', 'even', 'still', 'with',
-                       'from', 'by', 'up', 'out', 'down', 'back', 'over', 'through'}
     sentence_starts = [s.split()[0] if s.split() else '' for s in sentences]
     name_openers = sum(1 for w in sentence_starts
                        if w and w[0].isupper() and len(w) > 1
-                       and w.lower() not in common_starters)
+                       and w.lower() not in COMMON_STARTERS)
     name_opener_pct = (name_openers / num_sentences) * 100
 
-    # Interiority (thought verbs)
     thought_verbs = len(re.findall(
         r'\b(thought|wondered|realized|knew|felt|remembered|imagined|hoped|'
-        r'feared|wished|believed|supposed|figured|guessed|considered|'
-        r'understood|recognized|noticed|sensed)\b',
+        r'feared|wished|believed|supposed|figured|guessed)\b',
         corpus_text, re.IGNORECASE))
     interiority_pct = (thought_verbs / num_sentences) * 100
 
@@ -117,77 +131,45 @@ def build_baseline(corpus_text):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4.1: Em-dash Mechanical Removal
+# STAGE 4.1: Em-dash Removal
 # ---------------------------------------------------------------------------
 
 def remove_em_dashes(text):
-    """Replace em-dashes with periods or commas, context-aware."""
     count = 0
-
-    # Pattern: word — word (mid-sentence break)
     def replace_em(match):
         nonlocal count
         before = match.group(1)
         after = match.group(2)
         count += 1
-        # If after starts lowercase, use period + capitalize
         if after and after[0].islower():
             return f"{before}. {after[0].upper()}{after[1:]}"
         return f"{before}. {after}"
-
-    # Replace em-dash (—) and double-dash (--)
     text = re.sub(r'(\w+)\s*\u2014\s*(\w+)', replace_em, text)
     text = re.sub(r'(\w+)\s*--\s*(\w+)', replace_em, text)
-
-    # Catch any remaining standalone em-dashes
     remaining = text.count('\u2014') + text.count('--')
     text = text.replace('\u2014', '.').replace('--', '.')
     count += remaining
-
     return text, count
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4.2: Smoothing Word Mechanical Removal
+# STAGE 4.2: Smoothing Removal
 # ---------------------------------------------------------------------------
 
-SMOOTHING_WORDS = [
-    'however', 'moreover', 'furthermore', 'nevertheless', 'nonetheless',
-    'consequently', 'therefore', 'indeed', 'certainly', 'naturally',
-    'obviously', 'of course', 'in fact', 'as a matter of fact',
-    'it is worth noting', 'it should be noted', 'needless to say'
-]
-
-
 def remove_smoothing_words(text):
-    """Remove smoothing words and fix resulting punctuation."""
     count = 0
     for word in SMOOTHING_WORDS:
-        # Pattern: "However, " or "however, " at start of sentence
-        pattern = re.compile(
-            r'(?i)(?:^|\.\s+)' + re.escape(word) + r',?\s*',
-            re.MULTILINE
-        )
-        matches = pattern.findall(text)
-        if matches:
-            count += len(matches)
-
-        # Remove the word (case-insensitive) with optional trailing comma
-        # At start of sentence: "However, the..." -> "The..."
+        # Start of sentence: "However, the..." -> "The..."
+        text_before = text
         text = re.sub(
             r'(?i)((?:^|\.\s+))' + re.escape(word) + r',?\s*(\w)',
             lambda m: m.group(1) + m.group(2).upper(),
-            text,
-            flags=re.MULTILINE
+            text, flags=re.MULTILINE
         )
-        # Mid-sentence: "was, however, not" -> "was not"
-        text = re.sub(
-            r'(?i),?\s*' + re.escape(word) + r',?\s*',
-            ' ',
-            text
-        )
-
-    # Clean up double spaces
+        # Mid-sentence
+        text = re.sub(r'(?i),?\s*' + re.escape(word) + r',?\s*', ' ', text)
+        if text != text_before:
+            count += 1
     text = re.sub(r'  +', ' ', text)
     return text, count
 
@@ -196,67 +178,48 @@ def remove_smoothing_words(text):
 # STAGE 4.3: Opener Fix
 # ---------------------------------------------------------------------------
 
-def fix_name_openers(text, target_pct=40.0):
-    """
-    Reduce name-opener percentage by restructuring sentences.
-    Restructures some "Name verbed" openings to vary sentence starts.
-    """
+def fix_name_openers(text, target_pct=45.0):
     sentences = re.split(r'(?<=[.!?])\s+', text)
     if not sentences:
         return text, 0, 0
 
-    common_starters = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
-                       'this', 'that', 'there', 'when', 'where', 'what', 'how',
-                       'but', 'and', 'so', 'if', 'as', 'in', 'on', 'at', 'for',
-                       'to', 'his', 'her', 'my', 'our', 'its', 'no', 'not'}
-
-    # Find name-opener sentences
     name_opener_indices = []
     for i, s in enumerate(sentences):
         words = s.split()
         if words and words[0][0:1].isupper() and len(words[0]) > 1:
-            if words[0].lower() not in common_starters:
+            if words[0].lower() not in COMMON_STARTERS:
                 name_opener_indices.append(i)
 
     current_pct = (len(name_opener_indices) / max(len(sentences), 1)) * 100
     if current_pct <= target_pct:
         return text, round(current_pct, 1), 0
 
-    # How many to fix
     target_count = int(len(sentences) * (target_pct / 100))
     to_fix = len(name_opener_indices) - target_count
     fixes_made = 0
 
-    # Restructure some name openers (skip the first few — they're often intentional)
-    for idx in name_opener_indices[2:]:  # Skip first two
+    for idx in name_opener_indices[2:]:
         if fixes_made >= to_fix:
             break
         s = sentences[idx]
         words = s.split()
         if len(words) < 4:
             continue
+        # Try restructuring with a prepositional phrase move
+        prep_match = re.search(
+            r'\b(in the|on the|at the|from the|by the|through the|across the|behind the|under the)\b',
+            s, re.IGNORECASE)
+        if prep_match and prep_match.start() > len(words[0]) + 5:
+            phrase_start = prep_match.start()
+            rest = s[phrase_start:]
+            phrase_words = rest.split()[:4]
+            phrase = ' '.join(phrase_words)
+            before_phrase = s[:phrase_start].rstrip(' ,')
+            after_phrase = s[phrase_start + len(phrase):].lstrip(' ,')
+            sentences[idx] = f"{phrase.capitalize()}, {before_phrase.lower()}{after_phrase}"
+            fixes_made += 1
 
-        name = words[0]
-        # Try prepending with a transition from context
-        # "Jesse ran" -> "Without thinking, Jesse ran"
-        # "Dale laughed" -> "From the porch, Dale laughed"
-        # Simple approach: occasionally restructure
-        if fixes_made % 3 == 0 and len(words) > 5:
-            # Move a prepositional phrase to front if one exists later
-            prep_match = re.search(r'\b(in the|on the|at the|from the|by the|through the|across the|behind the)\b',
-                                   s, re.IGNORECASE)
-            if prep_match and prep_match.start() > len(name) + 5:
-                # Extract prep phrase (up to next comma or 5 words)
-                phrase_start = prep_match.start()
-                rest = s[phrase_start:]
-                phrase_words = rest.split()[:4]
-                phrase = ' '.join(phrase_words)
-                before_phrase = s[:phrase_start].rstrip(' ,')
-                after_phrase = s[phrase_start + len(phrase):].lstrip(' ,')
-                sentences[idx] = f"{phrase.capitalize()}, {before_phrase.lower()}{after_phrase}"
-                fixes_made += 1
-
-    new_pct = current_pct - (fixes_made / max(len(sentences), 1)) * 100
+    new_pct = (len(name_opener_indices) - fixes_made) / max(len(sentences), 1) * 100
     return ' '.join(sentences), round(new_pct, 1), fixes_made
 
 
@@ -265,40 +228,28 @@ def fix_name_openers(text, target_pct=40.0):
 # ---------------------------------------------------------------------------
 
 def isolate_impact_paragraphs(text, target_pct=30.0):
-    """
-    Ensure short, punchy paragraphs (1-2 sentences) make up ~25-40% of paragraphs.
-    Split some longer paragraphs at dramatic moments.
-    """
     paragraphs = text.split('\n\n')
     if not paragraphs:
         return text, 0, 0
 
-    # Count current short paragraphs (1-2 sentences)
-    short_count = 0
-    for p in paragraphs:
-        sents = [s.strip() for s in re.split(r'[.!?]+', p) if s.strip()]
-        if len(sents) <= 2:
-            short_count += 1
-
+    short_count = sum(1 for p in paragraphs
+                      if len([s for s in re.split(r'[.!?]+', p) if s.strip()]) <= 2)
     current_pct = (short_count / max(len(paragraphs), 1)) * 100
-    if current_pct >= target_pct * 0.8:  # Close enough
+    if current_pct >= target_pct * 0.8:
         return text, round(current_pct, 1), 0
 
-    # Find long paragraphs that could be split
     splits_made = 0
     new_paragraphs = []
+    impact_words = {'stopped', 'silence', 'nothing', 'gone', 'dead', 'dark',
+                    'alone', 'screamed', 'ran', 'heard', 'waited', 'empty',
+                    'still', 'quiet', 'frozen', 'cold'}
 
     for p in paragraphs:
         sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', p) if s.strip()]
         if len(sents) >= 4 and splits_made < 5:
-            # Look for a dramatic sentence to isolate
-            for i, s in enumerate(sents[1:-1], 1):  # Skip first and last
-                # Short sentences or sentences with strong words
+            for i, s in enumerate(sents[1:-1], 1):
                 if (len(s.split()) <= 6 or
-                    any(w in s.lower() for w in ['stopped', 'silence', 'nothing',
-                                                  'gone', 'dead', 'dark', 'alone',
-                                                  'screamed', 'ran', 'heard'])):
-                    # Split: everything before, the impact sentence, everything after
+                    any(w in s.lower() for w in impact_words)):
                     before = ' '.join(sents[:i])
                     impact = sents[i]
                     after = ' '.join(sents[i+1:])
@@ -317,207 +268,65 @@ def isolate_impact_paragraphs(text, target_pct=30.0):
     new_short = sum(1 for p in new_paragraphs
                     if len([s for s in re.split(r'[.!?]+', p) if s.strip()]) <= 2)
     new_pct = (new_short / max(len(new_paragraphs), 1)) * 100
-
     return result, round(new_pct, 1), splits_made
 
 
 # ---------------------------------------------------------------------------
-# STAGE 5: Quality Gate
+# Shared: compute chapter metrics
 # ---------------------------------------------------------------------------
 
-SCENE_TYPE_DIALOGUE_TARGETS = {
-    "reflective": (0, 15),
-    "social_confrontation": (45, 85),
-    "action": (10, 40),
-    "intimate": (30, 65),
-    "procedural": (5, 30),
-}
-
-
-def run_quality_gate(text, baseline_metrics, scene_type="reflective"):
-    """Full quality gate with 6 check categories. Returns score and details."""
-    word_count = len(text.split())
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    num_sentences = max(len(sentences), 1)
-    text_lower = text.lower()
-
-    issues = []
-    score = 0
-
-    # --- CHECK 1: Style Compliance ---
-    # Em-dashes
-    em_dashes = text.count('\u2014') + text.count('--')
-    if em_dashes > 0:
-        issues.append(f"[STYLE] Em-dashes remaining: {em_dashes}")
-        score += em_dashes * 3
-
-    # Semicolons
-    semicolons = text.count(';')
-    if semicolons > 0:
-        issues.append(f"[STYLE] Semicolons: {semicolons}")
-        score += semicolons
-
-    # --- CHECK 2: Contamination (AI-isms) ---
-    banned_words = ['delve', 'tapestry', 'unbeknownst', 'whilst', 'amidst',
-                    'little did he know', 'a chill ran down', 'the weight of',
-                    'something was off', 'pierced the silence', 'shattered the',
-                    'a tapestry of', 'in the tapestry', 'hung in the air',
-                    'sent shivers', 'etched across', 'knuckles whitened']
-    for bw in banned_words:
-        if bw in text_lower:
-            issues.append(f"[CONTAMINATION] '{bw}'")
-            score += 3
-
-    # Smoothing words
-    for sw in SMOOTHING_WORDS:
-        count = text_lower.count(sw.lower())
-        if count > 0:
-            issues.append(f"[CONTAMINATION] Smoothing word '{sw}': {count}")
-            score += count * 2
-
-    # --- CHECK 3: Dialogue Tags ---
-    all_tags = re.findall(
-        r'\b(said|asked|replied|whispered|shouted|muttered|called|cried|answered|'
-        r'growled|hissed|exclaimed|declared|snapped|barked|sighed|groaned|'
-        r'breathed|intoned|purred|proclaimed)\b',
-        text, re.IGNORECASE)
-    said_count = sum(1 for t in all_tags if t.lower() == 'said')
-    said_ratio = (said_count / max(len(all_tags), 1)) * 100
-
-    creative_tags = [t for t in all_tags if t.lower() not in
-                     ('said', 'asked', 'replied', 'whispered', 'shouted', 'called', 'cried', 'answered')]
-    if creative_tags:
-        unique_creative = set(t.lower() for t in creative_tags)
-        issues.append(f"[TAGS] Creative tags: {', '.join(unique_creative)}")
-        score += len(unique_creative)
-
-    if all_tags and said_ratio < 60:
-        issues.append(f"[TAGS] Said ratio low: {said_ratio:.0f}% (target: 70%+)")
-        score += 1
-
-    # --- CHECK 4: Adverb Density ---
-    non_adverbs = {'only', 'early', 'family', 'likely', 'belly', 'holy', 'ugly',
-                   'lonely', 'friendly', 'elderly', 'daily', 'fly', 'reply', 'supply'}
+def compute_chapter_metrics(text):
+    """Compute all 14 metrics for a chapter. Used by both quality gate and voice delta."""
     words = text.split()
-    adverbs = [w for w in words if w.lower().endswith('ly') and len(w) > 3
-               and w.lower() not in non_adverbs]
-    adverb_per_1k = (len(adverbs) / max(len(words), 1)) * 1000
-    if adverb_per_1k > 8:
-        issues.append(f"[ADVERBS] High density: {adverb_per_1k:.1f}/1k (target: <8)")
-        score += 2
-    if adverb_per_1k > 12:
-        score += 2  # Extra penalty
-
-    # --- CHECK 5: Rhythm ---
-    sent_lengths = [len(s.split()) for s in sentences]
-    if sent_lengths:
-        mean_sl = sum(sent_lengths) / len(sent_lengths)
-        variance = sum((l - mean_sl) ** 2 for l in sent_lengths) / len(sent_lengths)
-        stdev = variance ** 0.5
-
-        # Monotony detection: count clusters of similar-length sentences
-        clusters = 0
-        for i in range(len(sent_lengths) - 2):
-            a, b, c = sent_lengths[i], sent_lengths[i+1], sent_lengths[i+2]
-            if max(a, b, c) - min(a, b, c) <= 3:
-                clusters += 1
-        if clusters > 3:
-            issues.append(f"[RHYTHM] Monotonous clusters: {clusters} (target: ≤3)")
-            score += clusters - 3
-
-        if stdev < 3:
-            issues.append(f"[RHYTHM] Low variance: {stdev:.1f}")
-            score += 2
-
-    # --- CHECK 6: Name Openers ---
-    common_starters = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
-                       'this', 'that', 'there', 'when', 'where', 'what', 'how',
-                       'but', 'and', 'so', 'if', 'as', 'in', 'on', 'at', 'for',
-                       'to', 'his', 'her', 'my', 'our', 'its', 'no', 'not'}
-    sentence_starts = [s.split()[0] if s.split() else '' for s in sentences]
-    name_openers = sum(1 for w in sentence_starts
-                       if w and w[0].isupper() and len(w) > 1
-                       and w.lower() not in common_starters)
-    name_opener_pct = (name_openers / num_sentences) * 100
-    if name_opener_pct > 60:
-        issues.append(f"[OPENERS] Name opener: {name_opener_pct:.0f}% (target: <60%)")
-        score += 2
-
-    # --- CHECK 7: Dialogue Ratio (scene-type aware) ---
-    dialogue_lines = len(re.findall(r'"[^"]*"', text))
-    total_lines = max(len(text.split('\n')), 1)
-    dialogue_pct = (dialogue_lines / total_lines) * 100
-    target_range = SCENE_TYPE_DIALOGUE_TARGETS.get(scene_type, (10, 50))
-    if dialogue_pct < target_range[0] or dialogue_pct > target_range[1]:
-        issues.append(f"[DIALOGUE] {dialogue_pct:.0f}% (target: {target_range[0]}-{target_range[1]}% for {scene_type})")
-        score += 2
-
-    return {
-        "total_score": score,
-        "issues": issues,
-        "em_dashes": em_dashes,
-        "adverb_per_1k": round(adverb_per_1k, 1),
-        "said_ratio_pct": round(said_ratio, 1),
-        "name_opener_pct": round(name_opener_pct, 1),
-        "dialogue_pct": round(dialogue_pct, 1),
-        "word_count": word_count,
-        "sentence_count": num_sentences,
-        "rhythm_stdev": round(stdev, 1) if sent_lengths else 0,
-        "rhythm_clusters": clusters if sent_lengths else 0
-    }
-
-
-# ---------------------------------------------------------------------------
-# STAGE 6: Voice Delta with Z-Scores
-# ---------------------------------------------------------------------------
-
-def compute_voice_delta(text, baseline_metrics, scene_type="reflective"):
-    """Compare chapter metrics against baseline with z-score-like severity."""
-    word_count = len(text.split())
+    word_count = len(words)
     sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
     num_sentences = max(len(sentences), 1)
     sent_lengths = [len(s.split()) for s in sentences]
-
-    non_adverbs = {'only', 'early', 'family', 'likely', 'belly', 'holy', 'ugly',
-                   'lonely', 'friendly', 'elderly', 'daily'}
-    words = text.split()
-    adverbs = sum(1 for w in words if w.lower().endswith('ly') and len(w) > 3
-                  and w.lower() not in non_adverbs)
-
-    em_dashes = text.count('\u2014') + text.count('--')
-    dialogue_lines = len(re.findall(r'"[^"]*"', text))
-    fragments = sum(1 for l in sent_lengths if l < 5)
-
-    all_tags = re.findall(
-        r'\b(said|asked|replied|whispered|shouted|muttered|called|cried|answered|'
-        r'growled|hissed|exclaimed|declared|snapped)\b', text, re.IGNORECASE)
-    said_count = sum(1 for t in all_tags if t.lower() == 'said')
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
 
     mean_sl = sum(sent_lengths) / max(len(sent_lengths), 1)
     variance = sum((l - mean_sl) ** 2 for l in sent_lengths) / max(len(sent_lengths), 1)
     stdev = variance ** 0.5
 
+    fragments = sum(1 for l in sent_lengths if l < 5)
+    em_dashes = text.count('\u2014') + text.count('--')
+    dialogue_lines = len(re.findall(r'"[^"]*"', text))
+
+    adverbs = sum(1 for w in words if w.lower().endswith('ly') and len(w) > 3
+                  and w.lower() not in NON_ADVERBS)
+
+    all_tags = re.findall(
+        r'\b(said|asked|replied|whispered|shouted|muttered|called|cried|answered|'
+        r'growled|hissed|exclaimed|declared|snapped|barked|sighed|groaned)\b',
+        text, re.IGNORECASE)
+    said_count = sum(1 for t in all_tags if t.lower() == 'said')
+
+    smoothing_count = sum(text.lower().count(w) for w in SMOOTHING_WORDS)
+
     thought_verbs = len(re.findall(
         r'\b(thought|wondered|realized|knew|felt|remembered|imagined|hoped|feared)\b',
         text, re.IGNORECASE))
 
-    smoothing_count = sum(text.lower().count(w) for w in SMOOTHING_WORDS)
-
-    common_starters = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
-                       'this', 'that', 'there', 'when', 'where', 'what', 'how',
-                       'but', 'and', 'so', 'if', 'as', 'in', 'on', 'at', 'for',
-                       'to', 'his', 'her', 'my', 'our', 'its', 'no', 'not'}
     sentence_starts = [s.split()[0] if s.split() else '' for s in sentences]
     name_openers = sum(1 for w in sentence_starts
                        if w and w[0].isupper() and len(w) > 1
-                       and w.lower() not in common_starters)
+                       and w.lower() not in COMMON_STARTERS)
 
-    chapter_metrics = {
+    # Rhythm clusters
+    clusters = 0
+    for i in range(len(sent_lengths) - 2):
+        a, b, c = sent_lengths[i], sent_lengths[i+1], sent_lengths[i+2]
+        if max(a, b, c) - min(a, b, c) <= 3:
+            clusters += 1
+
+    has_dialogue = len(all_tags) > 0
+
+    return {
         "avg_sentence_length": round(mean_sl, 1),
         "sentence_length_stdev": round(stdev, 1),
         "fragment_pct": round((fragments / num_sentences) * 100, 1),
         "dialogue_ratio_pct": round((dialogue_lines / max(len(text.split('\n')), 1)) * 100, 1),
-        "avg_paragraph_length": round(word_count / max(len(text.split('\n\n')), 1), 1),
+        "avg_paragraph_length": round(word_count / max(len(paragraphs), 1), 1),
         "em_dash_per_1k": round((em_dashes / max(word_count, 1)) * 1000, 1),
         "semicolon_per_1k": round((text.count(';') / max(word_count, 1)) * 1000, 1),
         "exclamation_per_1k": round((text.count('!') / max(word_count, 1)) * 1000, 1),
@@ -527,16 +336,156 @@ def compute_voice_delta(text, baseline_metrics, scene_type="reflective"):
         "smoothing_per_1k": round((smoothing_count / max(word_count, 1)) * 1000, 1),
         "name_opener_pct": round((name_openers / num_sentences) * 100, 1),
         "said_ratio_pct": round((said_count / max(len(all_tags), 1)) * 100, 1),
+        "_word_count": word_count,
+        "_sentence_count": num_sentences,
+        "_rhythm_stdev": round(stdev, 1),
+        "_rhythm_clusters": clusters,
+        "_has_dialogue": has_dialogue,
+        "_all_tags": all_tags,
+        "_adverb_per_1k": round((adverbs / max(word_count, 1)) * 1000, 1),
     }
 
-    # Scene-type-aware dialogue check
-    target_range = SCENE_TYPE_DIALOGUE_TARGETS.get(scene_type, (10, 50))
+
+# ---------------------------------------------------------------------------
+# STAGE 5: Quality Gate
+# ---------------------------------------------------------------------------
+
+def run_quality_gate(text, metrics, scene_type="reflective"):
+    """Score the chapter. Only penalize REAL problems, not style compliance."""
+    issues = []
+    score = 0
+    text_lower = text.lower()
+
+    # --- Style compliance (penalize violations, NOT compliance) ---
+    em_dashes = metrics["em_dash_per_1k"]
+    if metrics.get("_word_count", 0) > 0:
+        raw_em = text.count('\u2014') + text.count('--')
+        if raw_em > 0:
+            issues.append(f"[STYLE] Em-dashes remaining: {raw_em}")
+            score += raw_em * 3
+
+    semicolons = text.count(';')
+    if semicolons > 0:
+        issues.append(f"[STYLE] Semicolons: {semicolons}")
+        score += semicolons
+
+    # --- Contamination ---
+    banned = ['delve', 'tapestry', 'unbeknownst', 'whilst', 'amidst',
+              'little did he know', 'a chill ran down', 'the weight of',
+              'something was off', 'pierced the silence', 'hung in the air',
+              'sent shivers', 'etched across', 'knuckles whitened']
+    for bw in banned:
+        if bw in text_lower:
+            issues.append(f"[CONTAMINATION] '{bw}'")
+            score += 3
+
+    for sw in SMOOTHING_WORDS:
+        count = text_lower.count(sw.lower())
+        if count > 0:
+            issues.append(f"[CONTAMINATION] Smoothing: '{sw}' x{count}")
+            score += count * 2
+
+    # --- Dialogue tags (only if chapter has dialogue) ---
+    if metrics["_has_dialogue"]:
+        all_tags = metrics["_all_tags"]
+        creative = [t for t in all_tags if t.lower() not in
+                    ('said', 'asked', 'replied', 'whispered', 'shouted',
+                     'called', 'cried', 'answered')]
+        if creative:
+            unique = set(t.lower() for t in creative)
+            issues.append(f"[TAGS] Creative: {', '.join(unique)}")
+            score += len(unique)
+        if metrics["said_ratio_pct"] < 60:
+            issues.append(f"[TAGS] Said ratio: {metrics['said_ratio_pct']:.0f}% (want 70%+)")
+            score += 1
+
+    # --- Adverbs ---
+    if metrics["_adverb_per_1k"] > 8:
+        issues.append(f"[ADVERBS] {metrics['_adverb_per_1k']:.1f}/1k (want <8)")
+        score += 2
+
+    # --- Rhythm ---
+    if metrics["_rhythm_clusters"] > 3:
+        issues.append(f"[RHYTHM] {metrics['_rhythm_clusters']} monotonous clusters (want ≤3)")
+        score += metrics["_rhythm_clusters"] - 3
+    if metrics["_rhythm_stdev"] < 3:
+        issues.append(f"[RHYTHM] Low variance: {metrics['_rhythm_stdev']:.1f}")
+        score += 2
+
+    # --- Name openers ---
+    if metrics["name_opener_pct"] > 60:
+        issues.append(f"[OPENERS] {metrics['name_opener_pct']:.0f}% (want <60%)")
+        score += 2
+
+    # --- Dialogue ratio (scene-type aware) ---
+    target_range = SCENE_TYPE_DIALOGUE_TARGETS.get(scene_type, (0, 50))
+    dial_pct = metrics["dialogue_ratio_pct"]
+    if dial_pct < target_range[0] or dial_pct > target_range[1]:
+        # Don't penalize 0% dialogue on action/reflective scenes
+        if not (dial_pct == 0 and target_range[0] == 0):
+            issues.append(f"[DIALOGUE] {dial_pct:.0f}% (want {target_range[0]}-{target_range[1]}% for {scene_type})")
+            score += 2
+
+    return {
+        "total_score": score,
+        "issues": issues,
+        "word_count": metrics["_word_count"],
+        "sentence_count": metrics["_sentence_count"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# STAGE 6: Voice Delta (style-rule-aware)
+# ---------------------------------------------------------------------------
+
+def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
+    """
+    Compare chapter metrics vs baseline.
+    KEY FIX: Respects style overrides and skips dialogue-dependent metrics 
+    when there's no dialogue.
+    """
+    target_range = SCENE_TYPE_DIALOGUE_TARGETS.get(scene_type, (0, 50))
+    has_dialogue = metrics.get("_has_dialogue", False)
 
     delta = {}
-    for metric, chapter_val in chapter_metrics.items():
+    for metric in ["avg_sentence_length", "sentence_length_stdev", "fragment_pct",
+                    "dialogue_ratio_pct", "avg_paragraph_length", "em_dash_per_1k",
+                    "semicolon_per_1k", "exclamation_per_1k", "question_per_1k",
+                    "interiority_pct", "adverb_per_1k", "smoothing_per_1k",
+                    "name_opener_pct", "said_ratio_pct"]:
+
+        chapter_val = metrics.get(metric, 0)
         baseline_val = baseline_metrics.get(metric, 0)
+
+        # --- RULE 1: Style overrides (bible says zero = zero is good) ---
+        if metric in STYLE_OVERRIDES:
+            target = STYLE_OVERRIDES[metric]
+            if chapter_val <= target:
+                severity = "ok"  # Compliance, not drift
+            else:
+                severity = "alarm"
+            delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
+                             "target": target, "severity": severity}
+            continue
+
+        # --- RULE 2: Skip dialogue-dependent metrics if no dialogue ---
+        if metric in DIALOGUE_DEPENDENT_METRICS and not has_dialogue:
+            delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
+                             "severity": "n/a (no dialogue)"}
+            continue
+
+        # --- RULE 3: Scene-type-aware dialogue ratio ---
+        if metric == "dialogue_ratio_pct":
+            if target_range[0] <= chapter_val <= target_range[1]:
+                severity = "ok"
+            else:
+                severity = "drift"
+            delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
+                             "severity": severity}
+            continue
+
+        # --- RULE 4: Standard drift calculation ---
         if isinstance(baseline_val, (int, float)) and baseline_val > 0:
-            # Z-score-like: how many baseline stdevs away
             pct_drift = abs(chapter_val - baseline_val) / baseline_val
             if pct_drift < 0.25:
                 severity = "ok"
@@ -544,42 +493,24 @@ def compute_voice_delta(text, baseline_metrics, scene_type="reflective"):
                 severity = "drift"
             else:
                 severity = "alarm"
+        elif chapter_val == 0:
+            severity = "ok"  # Both zero = fine
         else:
             severity = "ok"
 
-        # Override for dialogue ratio if within scene-type range
-        if metric == "dialogue_ratio_pct":
-            if target_range[0] <= chapter_val <= target_range[1]:
-                severity = "ok"
-
-        delta[metric] = {
-            "baseline": baseline_val,
-            "chapter": chapter_val,
-            "severity": severity
-        }
+        delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
+                         "severity": severity}
 
     return delta
 
 
 # ---------------------------------------------------------------------------
-# MAIN PIPELINE: produce_chapter
+# MAIN: produce_chapter
 # ---------------------------------------------------------------------------
 
 def produce_chapter(bible_text, baseline_metrics, chapter_beats, scene_type, config=None):
-    """
-    Full production pipeline:
-      Stage 2: Draft (API)
-      Stage 3: Corrective rewrite (API)
-      Stage 4.1: Em-dash removal
-      Stage 4.2: Smoothing removal
-      Stage 4.3: Opener fix
-      Stage 4.4: Impact paragraph isolation
-      Stage 5: Quality gate
-      Stage 6: Voice delta
-    """
     client = get_anthropic_client()
 
-    # Build voice target string
     voice_targets = []
     for metric, value in baseline_metrics.items():
         label = metric.replace("_", " ").replace("pct", "%").replace("per 1k", "/1k")
@@ -587,8 +518,8 @@ def produce_chapter(bible_text, baseline_metrics, chapter_beats, scene_type, con
     voice_target_str = "\n".join(voice_targets)
 
     # ---- STAGE 2: DRAFT ----
-    draft_prompt = f"""You are a fiction ghostwriter. Write a chapter based on the project bible 
-and chapter beats below. Write in the author's voice as described in the voice guide and style brief.
+    draft_prompt = f"""You are a fiction ghostwriter. Write a chapter based on the project bible
+and chapter beats below. Write in the author's voice.
 
 PROJECT BIBLE:
 {bible_text}
@@ -598,20 +529,20 @@ CHAPTER TO WRITE:
 
 Scene type: {scene_type}
 
-VOICE TARGETS (match these metrics from the author's existing writing):
+VOICE TARGETS:
 {voice_target_str}
 
 CRITICAL RULES:
-- Write ONLY the chapter prose. No headers, no meta-commentary, no "Chapter 1:" label.
-- Match the sentence rhythm described in the Voice Guide.
-- Follow ALL rules in the Style Brief exactly.
-- Use "said" for 70%+ of dialogue tags. Use action beats for the rest. No creative tags.
-- NO em-dashes. Use periods and sentence fragments instead.
+- Write ONLY chapter prose. No headers, no commentary, no "Chapter X:" label.
+- Match the Voice Guide's sentence rhythm.
+- Follow ALL Style Brief rules.
+- "said" for 70%+ of dialogue tags. Action beats for rest. No creative tags.
+- NO em-dashes. Use periods and fragments instead.
 - NO adverbs after dialogue tags.
 - NO smoothing words (however, moreover, furthermore, nevertheless, indeed, certainly, naturally, obviously).
 - NO purple prose. Concrete sensory details only.
-- NO words from the NEVER list in the Style Brief.
-- Hit the target word count specified in the beats.
+- NO words from the NEVER list.
+- Hit the target word count.
 - End the chapter exactly as the beats describe.
 
 Write the chapter now. Prose only."""
@@ -634,20 +565,21 @@ DRAFT:
 VOICE TARGETS:
 {voice_target_str}
 
-STYLE RULES:
-- Em-dashes: NONE. Replace with periods and sentence fragments.
-- Semicolons: No. Replace with periods.
-- Adverbs: Almost none. Cut any that don't earn their place.
-- "said" for 70%+ of dialogue tags. Cut creative tags. Use said or action beats.
-- NO smoothing words: however, moreover, furthermore, nevertheless, indeed, certainly, 
-  naturally, obviously, of course, in fact.
-- NO banned words: delve, tapestry, something was off, the weight of, a chill ran down, 
-  little did he know, unbeknownst, whilst, amidst.
-- Sentence fragments: Frequent in action/fear. Rare in calm scenes.
-- Concrete sensory details: Name specific trees, birds, sounds. Not just "a tree."
-- Interiority: Blend thoughts into narration. Shorter fragments when scared.
-- Vary sentence length. Mix short punchy with longer rolling. Avoid monotonous rhythm.
-- Ensure the ending matches the beats.
+REWRITE RULES:
+- Remove ALL em-dashes. Replace with periods + fragments.
+- Remove ALL semicolons. Replace with periods.
+- Cut adverbs. Almost none should remain.
+- "said" for 70%+ of dialogue tags. Replace creative tags with said or action beats.
+- Remove ALL smoothing words (however, moreover, furthermore, nevertheless, indeed,
+  certainly, naturally, obviously, of course, in fact). Restructure sentences without them.
+- Remove ALL banned words (delve, tapestry, something was off, the weight of, a chill ran down,
+  little did he know, unbeknownst, whilst, amidst).
+- Use sentence fragments frequently in action/fear. Rare in calm scenes.
+- Use concrete details: name specific trees, birds, sounds.
+- Blend thoughts into narration naturally. Shorter when scared.
+- Vary sentence length. Mix short punchy with longer rolling. No monotony.
+- Ensure ending matches the beats exactly.
+- Separate paragraphs with blank lines. Use short 1-2 sentence paragraphs for impact moments.
 
 Output ONLY the rewritten chapter. No commentary."""
 
@@ -656,60 +588,65 @@ Output ONLY the rewritten chapter. No commentary."""
         max_tokens=4000,
         messages=[{"role": "user", "content": rewrite_prompt}]
     )
-    rewrite_text = rewrite_response.content[0].text
+    text = rewrite_response.content[0].text
     rewrite_input = rewrite_response.usage.input_tokens
     rewrite_output = rewrite_response.usage.output_tokens
 
     # ---- STAGE 4.1: EM-DASH REMOVAL ----
-    text, em_dashes_removed = remove_em_dashes(rewrite_text)
+    text, em_removed = remove_em_dashes(text)
 
     # ---- STAGE 4.2: SMOOTHING REMOVAL ----
-    text, smoothing_removed = remove_smoothing_words(text)
+    text, smooth_removed = remove_smoothing_words(text)
 
     # ---- STAGE 4.3: OPENER FIX ----
-    text, opener_pct, openers_fixed = fix_name_openers(text, target_pct=40.0)
+    text, opener_pct, openers_fixed = fix_name_openers(text)
 
-    # ---- STAGE 4.4: IMPACT PARAGRAPH ISOLATION ----
-    text, impact_pct, impacts_split = isolate_impact_paragraphs(text, target_pct=30.0)
+    # ---- STAGE 4.4: IMPACT ISOLATION ----
+    text, impact_pct, impacts_split = isolate_impact_paragraphs(text)
+
+    # ---- Compute metrics once ----
+    metrics = compute_chapter_metrics(text)
 
     # ---- STAGE 5: QUALITY GATE ----
-    quality_report = run_quality_gate(text, baseline_metrics, scene_type)
+    quality_report = run_quality_gate(text, metrics, scene_type)
 
     # ---- STAGE 6: VOICE DELTA ----
-    voice_delta = compute_voice_delta(text, baseline_metrics, scene_type)
+    voice_delta = compute_voice_delta(metrics, baseline_metrics, scene_type)
 
-    # ---- Build hotspots ----
+    # ---- Hotspots ----
     hotspots = []
-    if em_dashes_removed > 0:
-        hotspots.append({"type": "post-process", "text": f"Removed {em_dashes_removed} em-dashes"})
-    if smoothing_removed > 0:
-        hotspots.append({"type": "post-process", "text": f"Removed {smoothing_removed} smoothing words"})
+    if em_removed > 0:
+        hotspots.append({"type": "fix", "text": f"Removed {em_removed} em-dashes"})
+    if smooth_removed > 0:
+        hotspots.append({"type": "fix", "text": f"Removed {smooth_removed} smoothing words"})
     if openers_fixed > 0:
-        hotspots.append({"type": "post-process", "text": f"Fixed {openers_fixed} name openers (now {opener_pct}%)"})
+        hotspots.append({"type": "fix", "text": f"Fixed {openers_fixed} name openers → {opener_pct}%"})
     if impacts_split > 0:
-        hotspots.append({"type": "post-process", "text": f"Isolated {impacts_split} impact paragraphs (now {impact_pct}%)"})
+        hotspots.append({"type": "fix", "text": f"Split {impacts_split} impact paragraphs → {impact_pct}%"})
+    for issue in quality_report.get("issues", []):
+        hotspots.append({"type": "issue", "text": issue})
 
-    # Token totals
+    # ---- Tokens ----
     total_input = draft_input + rewrite_input
     total_output = draft_output + rewrite_output
     cost = (total_input / 1_000_000 * 3) + (total_output / 1_000_000 * 15)
 
     return {
         "chapter_text": text,
-        "word_count": len(text.split()),
+        "word_count": metrics["_word_count"],
         "quality_score": quality_report["total_score"],
         "quality_report": quality_report,
         "voice_delta": voice_delta,
         "hotspots": hotspots,
         "manifest": {
-            "pipeline_version": "web-v2-full",
+            "pipeline_version": "web-v2",
             "scene_type": scene_type,
             "stages": ["draft", "rewrite", "em_dash_removal", "smoothing_removal",
                        "opener_fix", "impact_isolation", "quality_gate", "voice_delta"],
             "model": "claude-sonnet-4-20250514",
             "post_process": {
-                "em_dashes_removed": em_dashes_removed,
-                "smoothing_removed": smoothing_removed,
+                "em_dashes_removed": em_removed,
+                "smoothing_removed": smooth_removed,
                 "openers_fixed": openers_fixed,
                 "impacts_split": impacts_split,
             },
