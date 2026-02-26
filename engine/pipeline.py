@@ -610,16 +610,16 @@ RULES:
 - Hit the target word count specified in the beats.
 - End the chapter exactly as the beats describe.
 
-METRIC TARGETS (from the author's corpus — match these):
-- Average sentence length: ~{baseline_avg_sl:.0f} words per sentence.
-- Fragment percentage: ~{baseline_fragment:.0f}% of sentences should be fragments (under 5 words).
-- Interiority: ~{baseline_interiority:.0f}% of sentences should contain thought verbs (thought, wondered, knew, felt, realized, remembered, figured, hoped, feared).
-- Adverbs: ~{baseline_adverb:.0f} per 1,000 words. Not zero, not excessive.
+METRIC TARGETS (from the author's corpus — match these PRECISELY):
+- Average sentence length: ~{baseline_avg_sl:.0f} words per sentence. {"Write LONG flowing multi-clause sentences. Avoid choppy short sentences." if baseline_avg_sl > 12 else "Keep sentences moderate length."}
+- Fragment percentage: ~{baseline_fragment:.0f}%. {"Almost NO fragments. Use complete, well-constructed sentences." if baseline_fragment < 5 else f"About {baseline_fragment:.0f}% fragments."}
+- Interiority: ~{baseline_interiority:.0f}% of sentences should contain thought verbs (thought, wondered, knew, felt, realized, remembered, figured, hoped, feared). {"This is HIGH — the narrator reflects constantly. Weave thoughts into nearly every paragraph." if baseline_interiority > 8 else "Moderate interiority."}
+- Adverbs: EXACTLY ~{baseline_adverb:.0f} per 1,000 words. No more, no less. Do NOT over-use adverbs. {"That means roughly one adverb every 4-5 sentences. Do NOT put adverbs on every verb." if baseline_adverb > 10 else "Use sparingly."}
 - Questions: ~{baseline_question:.0f} question marks per 1,000 words.
 - Exclamations: ~{baseline_exclamation:.0f} exclamation marks per 1,000 words.
-- Average paragraph length: ~{baseline_para:.0f} words. Use blank lines between paragraphs.
-- Em-dashes: ~{baseline_em:.0f} per 1,000 words. {"Use em-dashes where natural." if baseline_em > 1 else "Avoid em-dashes."}
-- Smoothing words: ~{baseline_smooth:.1f} per 1,000 words. {"Use sparingly where natural." if baseline_smooth > 0.5 else "Avoid smoothing words."}
+- Average paragraph length: ~{baseline_para:.0f} words. {"Write LONG dense paragraphs of 4-8 sentences each. Do NOT break into short 1-2 sentence paragraphs unless at a major scene break." if baseline_para > 50 else "Keep paragraphs to 2-4 sentences."} Use blank lines between paragraphs.
+- Em-dashes: ~{baseline_em:.1f} per 1,000 words. {"Use em-dashes occasionally for parenthetical asides." if baseline_em > 0.2 else "Avoid em-dashes."}
+- Smoothing words: ~{baseline_smooth:.1f} per 1,000 words. {"Use occasionally where natural." if baseline_smooth > 0.2 else "Avoid smoothing words."}
 
 Write the chapter now. Prose only."""
 
@@ -642,14 +642,14 @@ VOICE METRICS TO MATCH:
 {voice_target_str}
 
 REWRITE PRIORITIES:
-1. Match the average sentence length (~{baseline_avg_sl:.0f} words). {"Lengthen short choppy sentences." if baseline_avg_sl > 10 else "Break up long sentences."}
-2. Fragment percentage should be ~{baseline_fragment:.0f}%. {"Add more fragments." if baseline_fragment > 20 else "Reduce fragments — use complete sentences."}
-3. Interiority should be ~{baseline_interiority:.0f}% of sentences with thought verbs (thought, wondered, knew, felt, realized, remembered).
-4. Adverbs should be ~{baseline_adverb:.0f} per 1,000 words. {"Add adverbs where natural." if baseline_adverb > 5 else "Keep adverbs minimal."}
+1. Match the average sentence length (~{baseline_avg_sl:.0f} words). {"Lengthen short choppy sentences — combine with commas, semicolons, relative clauses." if baseline_avg_sl > 12 else "Break up long sentences."}
+2. Fragment percentage should be ~{baseline_fragment:.0f}%. {"REDUCE fragments — convert to complete sentences. Almost no fragments allowed." if baseline_fragment < 5 else "Add more fragments." if baseline_fragment > 20 else f"Aim for ~{baseline_fragment:.0f}% fragments."}
+3. Interiority should be ~{baseline_interiority:.0f}% of sentences with thought verbs (thought, wondered, knew, felt, realized, remembered). {"ADD more interior reflection — the narrator should think, wonder, realize frequently." if baseline_interiority > 8 else "Moderate interiority."}
+4. Adverbs should be EXACTLY ~{baseline_adverb:.0f} per 1,000 words. {"The draft likely has too many or too few. COUNT them. If over {int(baseline_adverb * 1.3)} per 1k, REMOVE excess adverbs. If under {int(baseline_adverb * 0.7)}, add some." if baseline_adverb > 5 else "Keep adverbs minimal."}
 5. Questions: ~{baseline_question:.0f} per 1,000 words. Exclamations: ~{baseline_exclamation:.0f} per 1,000 words.
-6. Paragraph length: ~{baseline_para:.0f} words average. Use blank lines between paragraphs.
-7. Em-dashes: {"KEEP em-dashes, they're part of the voice." if baseline_em > 1 else "Remove em-dashes, replace with periods or commas."}
-8. Smoothing words: {"Keep where natural." if baseline_smooth > 0.5 else "Remove smoothing words (however, moreover, furthermore, etc)."}
+6. Paragraph length: ~{baseline_para:.0f} words average. {"MERGE short paragraphs together. Aim for 4-8 sentences per paragraph. Do NOT leave 1-2 sentence paragraphs unless at a major scene transition." if baseline_para > 50 else "Keep paragraphs to 2-4 sentences."} Use blank lines between paragraphs.
+7. Em-dashes: {"KEEP em-dashes, they're part of the voice (~{:.1f} per 1k).".format(baseline_em) if baseline_em > 0.2 else "Remove em-dashes, replace with periods or commas."}
+8. Smoothing words: {"Keep occasional smoothing words (~{:.1f} per 1k).".format(baseline_smooth) if baseline_smooth > 0.2 else "Remove smoothing words (however, moreover, furthermore, etc)."}
 9. Vary sentence length. Mix short with long. Avoid monotonous rhythm.
 10. Ensure the ending matches the beats exactly.
 
