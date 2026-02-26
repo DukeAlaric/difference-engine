@@ -1,15 +1,20 @@
 """
 engine/pipeline.py — Full production pipeline for the Difference Engine web app.
+VERSION: web-v4 (voice-agnostic)
+
+All style rules now come from the bible, not hardcoded in the pipeline.
+Post-processing stages are conditional based on baseline metrics.
+Prompts reference the bible for voice/style guidance instead of hardcoding rules.
 
 Stages:
   2. Draft generation (Claude API)
   3. Corrective rewrite (Claude API)
-  4.1 Em-dash mechanical removal
-  4.2 Smoothing word mechanical removal
-  4.3 Opener fix (FIXED: no more word mangling)
+  4.1 Em-dash removal (CONDITIONAL — only if baseline em-dash is 0 or bible says no)
+  4.2 Smoothing removal (CONDITIONAL — only if baseline smoothing is low)
+  4.3 Opener fix
   4.4 Impact paragraph isolation
-  4.5 Paragraph splitter (break long paragraphs)
-  5. Quality gate (full scoring)
+  4.5 Paragraph splitter
+  5. Quality gate
   6. Voice delta (style-rule-aware)
 """
 
@@ -24,16 +29,8 @@ def get_anthropic_client():
 
 
 # ---------------------------------------------------------------------------
-# Style rules that override baseline comparison
+# Constants
 # ---------------------------------------------------------------------------
-
-STYLE_OVERRIDES = {
-    "em_dash_per_1k": 0,
-    "semicolon_per_1k": 0,
-    "smoothing_per_1k": 0,
-}
-
-DIALOGUE_DEPENDENT_METRICS = {"said_ratio_pct", "dialogue_ratio_pct"}
 
 SMOOTHING_WORDS = [
     'however', 'moreover', 'furthermore', 'nevertheless', 'nonetheless',
@@ -62,6 +59,12 @@ COMMON_STARTERS = {'the', 'a', 'an', 'it', 'he', 'she', 'they', 'we', 'i',
                    'one', 'two', 'some', 'any', 'every', 'each', 'after',
                    'before', 'now', 'then', 'just', 'even', 'still', 'with',
                    'from', 'by', 'up', 'out', 'down', 'back', 'over', 'through'}
+
+# Contamination words that are ALWAYS bad regardless of voice
+ALWAYS_BANNED = ['delve', 'tapestry', 'unbeknownst', 'a tapestry of',
+                 'in the tapestry', 'little did he know',
+                 'pierced the silence', 'sent shivers', 'etched across',
+                 'knuckles whitened']
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +117,7 @@ def build_baseline(corpus_text):
         "avg_sentence_length": round(avg_sl, 1),
         "sentence_length_stdev": round(stdev, 1),
         "fragment_pct": round((fragments / num_sentences) * 100, 1),
-        "dialogue_ratio_pct": round((dialogue_lines / max(len(corpus_text.split('\n')), 1)) * 100, 1),
+        "dialogue_ratio_pct": round((dialogue_lines / max(len(paragraphs), 1)) * 100, 1),
         "avg_paragraph_length": round(word_count / max(len(paragraphs), 1), 1),
         "em_dash_per_1k": round((em_dashes / max(word_count, 1)) * 1000, 1),
         "semicolon_per_1k": round((corpus_text.count(';') / max(word_count, 1)) * 1000, 1),
@@ -130,7 +133,7 @@ def build_baseline(corpus_text):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4.1: Em-dash Removal
+# STAGE 4.1: Em-dash Removal (CONDITIONAL)
 # ---------------------------------------------------------------------------
 
 def remove_em_dashes(text):
@@ -152,7 +155,7 @@ def remove_em_dashes(text):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4.2: Smoothing Removal
+# STAGE 4.2: Smoothing Removal (CONDITIONAL)
 # ---------------------------------------------------------------------------
 
 def remove_smoothing_words(text):
@@ -172,16 +175,10 @@ def remove_smoothing_words(text):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 4.3: Opener Fix (FIXED — no more word mangling)
+# STAGE 4.3: Opener Fix
 # ---------------------------------------------------------------------------
 
 def fix_name_openers(text, target_pct=45.0):
-    """
-    Reduce name-opener percentage. ONLY operates on sentences where a safe
-    prepositional phrase can be cleanly extracted and moved to the front.
-    Uses word-index slicing instead of character-index slicing to prevent
-    the concatenation bug (e.g. "sitsof", "worksin").
-    """
     sentences = re.split(r'(?<=[.!?])\s+', text)
     if not sentences:
         return text, 0, 0
@@ -201,14 +198,13 @@ def fix_name_openers(text, target_pct=45.0):
     to_fix = len(name_opener_indices) - target_count
     fixes_made = 0
 
-    # Prepositions we look for (must be followed by a noun phrase)
     prep_patterns = [
         'in the', 'on the', 'at the', 'from the', 'by the',
         'through the', 'across the', 'behind the', 'under the',
         'with the', 'near the', 'past the', 'along the',
     ]
 
-    for idx in name_opener_indices[2:]:  # Skip first two
+    for idx in name_opener_indices[2:]:
         if fixes_made >= to_fix:
             break
         s = sentences[idx]
@@ -216,13 +212,11 @@ def fix_name_openers(text, target_pct=45.0):
         if len(words) < 6:
             continue
 
-        # Find a prepositional phrase by word position (not character position)
         best_prep = None
         best_prep_start = None
         for prep in prep_patterns:
             prep_words = prep.split()
             prep_len = len(prep_words)
-            # Search for prep phrase starting after word 2 (don't grab from sentence start)
             for wi in range(2, len(words) - prep_len - 1):
                 candidate = ' '.join(words[wi:wi + prep_len]).lower()
                 if candidate == prep:
@@ -235,44 +229,33 @@ def fix_name_openers(text, target_pct=45.0):
         if not best_prep or best_prep_start is None:
             continue
 
-        # Extract the phrase: prep + up to 2 more words (the noun phrase)
         prep_word_count = len(best_prep.split())
-        # Grab prep + next 2 words as the phrase to move
         phrase_end = min(best_prep_start + prep_word_count + 2, len(words))
         phrase_words = words[best_prep_start:phrase_end]
 
-        # Strip trailing punctuation from phrase
         if phrase_words:
             phrase_words[-1] = phrase_words[-1].rstrip('.,;:')
 
-        # Build the new sentence:
-        # [phrase], [everything before phrase] [everything after phrase].
         before_words = words[:best_prep_start]
         after_words = words[phrase_end:]
 
-        # Remove trailing comma/space from before_words
         if before_words:
             before_words[-1] = before_words[-1].rstrip(',')
 
         phrase_str = ' '.join(phrase_words)
-        # Capitalize first word of phrase
         phrase_str = phrase_str[0].upper() + phrase_str[1:]
 
-        # Lowercase the old sentence start (now mid-sentence)
         if before_words:
             before_words[0] = before_words[0][0].lower() + before_words[0][1:]
 
         remaining = before_words + after_words
         remaining_str = ' '.join(remaining)
 
-        # Make sure remaining isn't empty
         if not remaining_str.strip():
             continue
 
-        # Reconstruct: "In the bottoms, jesse ran through mud."
         new_sentence = f"{phrase_str}, {remaining_str}"
 
-        # Make sure we haven't mangled anything — sanity check
         if '  ' not in new_sentence and len(new_sentence.split()) >= 4:
             sentences[idx] = new_sentence
             fixes_made += 1
@@ -334,10 +317,6 @@ def isolate_impact_paragraphs(text, target_pct=30.0):
 # ---------------------------------------------------------------------------
 
 def split_long_paragraphs(text, max_words=50):
-    """
-    Break paragraphs that exceed max_words at the best sentence boundary.
-    Targets avg_paragraph_length closer to baseline (~20-30 words).
-    """
     paragraphs = text.split('\n\n')
     new_paragraphs = []
     splits_made = 0
@@ -348,13 +327,11 @@ def split_long_paragraphs(text, max_words=50):
             new_paragraphs.append(p)
             continue
 
-        # Split at sentence boundaries
         sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', p) if s.strip()]
         if len(sents) < 2:
             new_paragraphs.append(p)
             continue
 
-        # Find the best split point near the middle
         current_chunk = []
         current_words = 0
 
@@ -380,7 +357,6 @@ def split_long_paragraphs(text, max_words=50):
 # ---------------------------------------------------------------------------
 
 def compute_chapter_metrics(text):
-    """Compute all 14 metrics for a chapter."""
     words = text.split()
     word_count = len(words)
     sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
@@ -428,7 +404,7 @@ def compute_chapter_metrics(text):
         "avg_sentence_length": round(mean_sl, 1),
         "sentence_length_stdev": round(stdev, 1),
         "fragment_pct": round((fragments / num_sentences) * 100, 1),
-        "dialogue_ratio_pct": round((dialogue_lines / max(len(text.split('\n')), 1)) * 100, 1),
+        "dialogue_ratio_pct": round((dialogue_lines / max(len(paragraphs), 1)) * 100, 1),
         "avg_paragraph_length": round(word_count / max(len(paragraphs), 1), 1),
         "em_dash_per_1k": round((em_dashes / max(word_count, 1)) * 1000, 1),
         "semicolon_per_1k": round((text.count(';') / max(word_count, 1)) * 1000, 1),
@@ -454,40 +430,17 @@ def compute_chapter_metrics(text):
 # ---------------------------------------------------------------------------
 
 def run_quality_gate(text, metrics, scene_type="reflective"):
-    """Score the chapter. Only penalize REAL problems, not style compliance."""
     issues = []
     score = 0
     text_lower = text.lower()
 
-    # --- Style compliance ---
-    if metrics.get("_word_count", 0) > 0:
-        raw_em = text.count('\u2014') + text.count('--')
-        if raw_em > 0:
-            issues.append(f"[STYLE] Em-dashes remaining: {raw_em}")
-            score += raw_em * 3
-
-    semicolons = text.count(';')
-    if semicolons > 0:
-        issues.append(f"[STYLE] Semicolons: {semicolons}")
-        score += semicolons
-
-    # --- Contamination ---
-    banned = ['delve', 'tapestry', 'unbeknownst', 'whilst', 'amidst',
-              'little did he know', 'a chill ran down', 'the weight of',
-              'something was off', 'pierced the silence', 'hung in the air',
-              'sent shivers', 'etched across', 'knuckles whitened']
-    for bw in banned:
+    # --- Contamination (always checked) ---
+    for bw in ALWAYS_BANNED:
         if bw in text_lower:
             issues.append(f"[CONTAMINATION] '{bw}'")
             score += 3
 
-    for sw in SMOOTHING_WORDS:
-        count = text_lower.count(sw.lower())
-        if count > 0:
-            issues.append(f"[CONTAMINATION] Smoothing: '{sw}' x{count}")
-            score += count * 2
-
-    # --- Dialogue tags (only if chapter has meaningful dialogue) ---
+    # --- Dialogue tags (only with 3+ tags) ---
     if metrics["_has_dialogue"] and len(metrics["_all_tags"]) >= 3:
         all_tags = metrics["_all_tags"]
         creative = [t for t in all_tags if t.lower() not in
@@ -497,20 +450,17 @@ def run_quality_gate(text, metrics, scene_type="reflective"):
             unique = set(t.lower() for t in creative)
             issues.append(f"[TAGS] Creative: {', '.join(unique)}")
             score += len(unique)
-        if metrics["said_ratio_pct"] < 60:
-            issues.append(f"[TAGS] Said ratio: {metrics['said_ratio_pct']:.0f}% (want 70%+)")
-            score += 1
 
-    # --- Adverbs (only alarm if WAY over, not if slightly under) ---
-    if metrics["_adverb_per_1k"] > 12:
-        issues.append(f"[ADVERBS] High: {metrics['_adverb_per_1k']:.1f}/1k (want <12)")
+    # --- Adverbs (only alarm if excessive) ---
+    if metrics["_adverb_per_1k"] > 15:
+        issues.append(f"[ADVERBS] High: {metrics['_adverb_per_1k']:.1f}/1k (want <15)")
         score += 2
 
     # --- Rhythm ---
-    if metrics["_rhythm_clusters"] > 3:
-        issues.append(f"[RHYTHM] {metrics['_rhythm_clusters']} monotonous clusters (want ≤3)")
-        score += metrics["_rhythm_clusters"] - 3
-    if metrics["_rhythm_stdev"] < 3:
+    if metrics["_rhythm_clusters"] > 5:
+        issues.append(f"[RHYTHM] {metrics['_rhythm_clusters']} monotonous clusters")
+        score += metrics["_rhythm_clusters"] - 5
+    if metrics["_rhythm_stdev"] < 2:
         issues.append(f"[RHYTHM] Low variance: {metrics['_rhythm_stdev']:.1f}")
         score += 2
 
@@ -536,11 +486,12 @@ def run_quality_gate(text, metrics, scene_type="reflective"):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 6: Voice Delta (style-rule-aware)
+# STAGE 6: Voice Delta
 # ---------------------------------------------------------------------------
 
+DIALOGUE_DEPENDENT_METRICS = {"said_ratio_pct", "dialogue_ratio_pct"}
+
 def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
-    """Compare chapter metrics vs baseline. Respects style overrides."""
     target_range = SCENE_TYPE_DIALOGUE_TARGETS.get(scene_type, (0, 50))
     has_dialogue = metrics.get("_has_dialogue", False)
 
@@ -554,24 +505,13 @@ def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
         chapter_val = metrics.get(metric, 0)
         baseline_val = baseline_metrics.get(metric, 0)
 
-        # RULE 1: Style overrides
-        if metric in STYLE_OVERRIDES:
-            target = STYLE_OVERRIDES[metric]
-            if chapter_val <= target:
-                severity = "ok"
-            else:
-                severity = "alarm"
-            delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
-                             "target": target, "severity": severity}
-            continue
-
-        # RULE 2: Skip dialogue-dependent metrics if no dialogue
+        # Skip dialogue-dependent metrics if no dialogue
         if metric in DIALOGUE_DEPENDENT_METRICS and not has_dialogue:
             delta[metric] = {"baseline": baseline_val, "chapter": chapter_val,
                              "severity": "n/a (no dialogue)"}
             continue
 
-        # RULE 2b: Said ratio with tiny sample (1-2 tags) is unreliable
+        # Said ratio with tiny sample
         if metric == "said_ratio_pct":
             num_tags = len(metrics.get("_all_tags", []))
             if num_tags < 3:
@@ -579,7 +519,7 @@ def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
                                  "severity": f"n/a ({num_tags} tags)"}
                 continue
 
-        # RULE 3: Scene-type-aware dialogue ratio
+        # Scene-type-aware dialogue ratio
         if metric == "dialogue_ratio_pct":
             if target_range[0] <= chapter_val <= target_range[1]:
                 severity = "ok"
@@ -589,7 +529,7 @@ def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
                              "severity": severity}
             continue
 
-        # RULE 4: Standard drift calculation
+        # Standard drift calculation
         if isinstance(baseline_val, (int, float)) and baseline_val > 0:
             pct_drift = abs(chapter_val - baseline_val) / baseline_val
             if pct_drift < 0.25:
@@ -598,8 +538,10 @@ def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
                 severity = "drift"
             else:
                 severity = "alarm"
-        elif chapter_val == 0:
+        elif chapter_val == 0 and baseline_val == 0:
             severity = "ok"
+        elif baseline_val == 0 and chapter_val > 0:
+            severity = "ok"  # Can't drift from zero
         else:
             severity = "ok"
 
@@ -610,26 +552,45 @@ def compute_voice_delta(metrics, baseline_metrics, scene_type="reflective"):
 
 
 # ---------------------------------------------------------------------------
-# MAIN: produce_chapter
+# MAIN: produce_chapter (VOICE-AGNOSTIC)
 # ---------------------------------------------------------------------------
 
 def produce_chapter(bible_text, baseline_metrics, chapter_beats, scene_type, config=None):
     client = get_anthropic_client()
 
-    # Build voice target string for prompts
+    # Build voice target string
     voice_targets = []
     for metric, value in baseline_metrics.items():
+        if metric == "corpus_word_count":
+            continue
         label = metric.replace("_", " ").replace("pct", "%").replace("per 1k", "/1k")
         voice_targets.append(f"  - {label}: {value}")
     voice_target_str = "\n".join(voice_targets)
 
-    # Get interiority and adverb targets from baseline
-    target_interiority = baseline_metrics.get("interiority_pct", 4.0)
-    target_adverb = baseline_metrics.get("adverb_per_1k", 7.0)
+    # Determine style features from baseline
+    baseline_em = baseline_metrics.get("em_dash_per_1k", 0)
+    baseline_smooth = baseline_metrics.get("smoothing_per_1k", 0)
+    baseline_adverb = baseline_metrics.get("adverb_per_1k", 7)
+    baseline_interiority = baseline_metrics.get("interiority_pct", 4)
+    baseline_question = baseline_metrics.get("question_per_1k", 5)
+    baseline_exclamation = baseline_metrics.get("exclamation_per_1k", 2)
+    baseline_fragment = baseline_metrics.get("fragment_pct", 15)
+    baseline_avg_sl = baseline_metrics.get("avg_sentence_length", 12)
+    baseline_para = baseline_metrics.get("avg_paragraph_length", 25)
+
+    # Determine target word count from chapter beats (look for word count mention)
+    # Default to 4000 max tokens, increase for longer chapters
+    max_tokens = 4000
+    if "3,000" in chapter_beats or "3000" in chapter_beats or "3,500" in chapter_beats:
+        max_tokens = 6000
+    elif "2,000" in chapter_beats or "2000" in chapter_beats or "2,500" in chapter_beats:
+        max_tokens = 5000
+    elif "1,500" in chapter_beats or "1500" in chapter_beats:
+        max_tokens = 4000
 
     # ---- STAGE 2: DRAFT ----
     draft_prompt = f"""You are a fiction ghostwriter. Write a chapter based on the project bible
-and chapter beats below. Write in the author's voice.
+and chapter beats below. Match the author's voice EXACTLY as described in the bible.
 
 PROJECT BIBLE:
 {bible_text}
@@ -639,52 +600,32 @@ CHAPTER TO WRITE:
 
 Scene type: {scene_type}
 
-VOICE TARGETS:
+VOICE METRICS FROM THE AUTHOR'S EXISTING WORK (match these closely):
 {voice_target_str}
 
-CRITICAL RULES:
+RULES:
 - Write ONLY chapter prose. No headers, no commentary, no "Chapter X:" label.
-- Match the Voice Guide's sentence rhythm.
-- Follow ALL rules in the Style Brief exactly.
-- "said" for 70%+ of dialogue tags. Action beats for the rest. No creative tags.
-- NO em-dashes. Use periods and fragments instead.
-- NO smoothing words (however, moreover, furthermore, nevertheless, indeed, certainly, naturally, obviously).
-- NO purple prose. Concrete sensory details only.
-- NO words from the NEVER list.
-- Hit the target word count.
+- Match the voice, tone, POV, and style described in the bible EXACTLY.
+- Follow ALL style rules in the bible. The bible is your authority on voice.
+- Hit the target word count specified in the beats.
 - End the chapter exactly as the beats describe.
 
-INTERIORITY — This is critical for voice match:
-- The narrator is an internal processor. Weave thought verbs into the narration naturally.
-- Use words like: thought, wondered, knew, felt, realized, remembered, figured, guessed, hoped, feared.
-- Target: roughly {target_interiority:.0f}% of sentences should contain a thought verb.
-- Blend them in: "I knew Daddy would be mad" not "I thought to myself that Daddy would be mad."
-- More interiority in reflective/quiet moments, less during pure action.
-
-ADVERBS — IMPORTANT: Include {target_adverb:.0f} adverbs per 1,000 words. NOT ZERO.
-- You MUST include adverbs. A chapter with zero adverbs fails quality checks.
-- Good: "barely breathing", "mostly quiet", "nearly tripped", "already dark", "hardly any"
-- Bad: adverbs on dialogue tags ("said quietly"). Don't do that.
-- Scatter them naturally through the prose. Example: "The water was barely ankle deep."
-
-QUESTIONS AND EXCLAMATIONS — Include both:
-- Include ~{baseline_metrics.get('question_per_1k', 6):.0f} question marks per 1,000 words.
-- Internal questions are the character's voice: "Was it getting closer?" "How far to the road?"
-- Include ~{baseline_metrics.get('exclamation_per_1k', 2):.0f} exclamation marks per 1,000 words.
-- Use for genuine shock or emphasis, not generic excitement.
-
-PARAGRAPHING:
-- Use blank lines between paragraphs.
-- Keep paragraphs short: 2-4 sentences average.
-- Use 1-sentence paragraphs for impact moments.
-- A new paragraph for each speaker in dialogue.
-- A new paragraph when the camera moves or time shifts.
+METRIC TARGETS (from the author's corpus — match these):
+- Average sentence length: ~{baseline_avg_sl:.0f} words per sentence.
+- Fragment percentage: ~{baseline_fragment:.0f}% of sentences should be fragments (under 5 words).
+- Interiority: ~{baseline_interiority:.0f}% of sentences should contain thought verbs (thought, wondered, knew, felt, realized, remembered, figured, hoped, feared).
+- Adverbs: ~{baseline_adverb:.0f} per 1,000 words. Not zero, not excessive.
+- Questions: ~{baseline_question:.0f} question marks per 1,000 words.
+- Exclamations: ~{baseline_exclamation:.0f} exclamation marks per 1,000 words.
+- Average paragraph length: ~{baseline_para:.0f} words. Use blank lines between paragraphs.
+- Em-dashes: ~{baseline_em:.0f} per 1,000 words. {"Use em-dashes where natural." if baseline_em > 1 else "Avoid em-dashes."}
+- Smoothing words: ~{baseline_smooth:.1f} per 1,000 words. {"Use sparingly where natural." if baseline_smooth > 0.5 else "Avoid smoothing words."}
 
 Write the chapter now. Prose only."""
 
     draft_response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4000,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": draft_prompt}]
     )
     draft_text = draft_response.content[0].text
@@ -692,80 +633,69 @@ Write the chapter now. Prose only."""
     draft_output = draft_response.usage.output_tokens
 
     # ---- STAGE 3: CORRECTIVE REWRITE ----
-    rewrite_prompt = f"""You are a fiction editor. Rewrite the draft to better match the author's voice.
+    rewrite_prompt = f"""You are a fiction editor. Rewrite the draft to better match the author's voice metrics.
 
 DRAFT:
 {draft_text}
 
-VOICE TARGETS:
+VOICE METRICS TO MATCH:
 {voice_target_str}
 
-REWRITE RULES:
-- Remove ALL em-dashes. Replace with periods + fragments.
-- Remove ALL semicolons. Replace with periods.
-- "said" for 70%+ of dialogue tags. Replace creative tags with said or action beats.
-- Remove ALL smoothing words (however, moreover, furthermore, nevertheless, indeed,
-  certainly, naturally, obviously, of course, in fact). Restructure sentences without them.
-- Remove ALL banned words (delve, tapestry, something was off, the weight of, a chill ran down,
-  little did he know, unbeknownst, whilst, amidst).
-- Use sentence fragments frequently in action/fear. Rare in calm scenes.
-- Use concrete details: name specific trees, birds, sounds.
-- Vary sentence length. Mix short punchy with longer rolling. No monotony.
-- Ensure ending matches the beats exactly.
+REWRITE PRIORITIES:
+1. Match the average sentence length (~{baseline_avg_sl:.0f} words). {"Lengthen short choppy sentences." if baseline_avg_sl > 10 else "Break up long sentences."}
+2. Fragment percentage should be ~{baseline_fragment:.0f}%. {"Add more fragments." if baseline_fragment > 20 else "Reduce fragments — use complete sentences."}
+3. Interiority should be ~{baseline_interiority:.0f}% of sentences with thought verbs (thought, wondered, knew, felt, realized, remembered).
+4. Adverbs should be ~{baseline_adverb:.0f} per 1,000 words. {"Add adverbs where natural." if baseline_adverb > 5 else "Keep adverbs minimal."}
+5. Questions: ~{baseline_question:.0f} per 1,000 words. Exclamations: ~{baseline_exclamation:.0f} per 1,000 words.
+6. Paragraph length: ~{baseline_para:.0f} words average. Use blank lines between paragraphs.
+7. Em-dashes: {"KEEP em-dashes, they're part of the voice." if baseline_em > 1 else "Remove em-dashes, replace with periods or commas."}
+8. Smoothing words: {"Keep where natural." if baseline_smooth > 0.5 else "Remove smoothing words (however, moreover, furthermore, etc)."}
+9. Vary sentence length. Mix short with long. Avoid monotonous rhythm.
+10. Ensure the ending matches the beats exactly.
 
-INTERIORITY — Preserve and enhance:
-- Keep all thought verbs from the draft (thought, wondered, knew, felt, realized, remembered).
-- If interiority is low, ADD thought verbs blended into narration.
-- Target: ~{target_interiority:.0f}% of sentences should have a thought verb.
-- "I knew" / "I figured" / "I wondered" are the character's voice. Don't cut them.
-
-ADVERBS — MAINTAIN, do not strip:
-- The draft should contain adverbs. KEEP THEM. Target ~{target_adverb:.0f} per 1,000 words.
-- Only remove adverbs that modify dialogue tags ("said quietly" → "said").
-- DO NOT remove adverbs from narration. "barely", "mostly", "nearly", "hardly" stay.
-- If the draft has zero adverbs, ADD some: "barely visible", "mostly dark", "nearly fell".
-
-QUESTIONS AND EXCLAMATIONS — Preserve and add:
-- Keep all ? and ! from the draft.
-- Target ~{baseline_metrics.get('question_per_1k', 6):.0f} question marks per 1,000 words.
-- Internal character questions: "Was it closer now?" "Could I make it to the road?"
-- Target ~{baseline_metrics.get('exclamation_per_1k', 2):.0f} exclamation marks per 1,000 words.
-- If the draft is missing these, add 2-3 internal questions and 1-2 exclamations.
-
-PARAGRAPHING — Critical:
-- Separate every paragraph with a blank line.
-- Keep paragraphs to 2-4 sentences average.
-- Use 1-sentence paragraphs for impact moments.
-- New paragraph for each speaker change in dialogue.
-- Average paragraph length target: ~{baseline_metrics.get('avg_paragraph_length', 20):.0f} words.
+CRITICAL: Do NOT impose rules that aren't in the voice metrics. If the baseline shows em-dashes, KEEP them.
+If the baseline shows long sentences, write LONG sentences. Match the numbers.
 
 Output ONLY the rewritten chapter. No commentary."""
 
     rewrite_response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4000,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": rewrite_prompt}]
     )
     text = rewrite_response.content[0].text
     rewrite_input = rewrite_response.usage.input_tokens
     rewrite_output = rewrite_response.usage.output_tokens
 
-    # ---- STAGE 4.1: EM-DASH REMOVAL ----
-    text, em_removed = remove_em_dashes(text)
+    # ---- CONDITIONAL POST-PROCESSING ----
+    em_removed = 0
+    smooth_removed = 0
+    openers_fixed = 0
+    opener_pct = 0
+    impacts_split = 0
+    impact_pct = 0
+    para_splits = 0
 
-    # ---- STAGE 4.2: SMOOTHING REMOVAL ----
-    text, smooth_removed = remove_smoothing_words(text)
+    # 4.1: Em-dash removal ONLY if baseline says no em-dashes
+    if baseline_em < 1:
+        text, em_removed = remove_em_dashes(text)
 
-    # ---- STAGE 4.3: OPENER FIX ----
-    text, opener_pct, openers_fixed = fix_name_openers(text)
+    # 4.2: Smoothing removal ONLY if baseline has very low smoothing
+    if baseline_smooth < 0.5:
+        text, smooth_removed = remove_smoothing_words(text)
 
-    # ---- STAGE 4.4: IMPACT ISOLATION ----
+    # 4.3: Opener fix (always — but uses baseline target)
+    opener_target = min(baseline_metrics.get("name_opener_pct", 30) * 1.5, 55)
+    text, opener_pct, openers_fixed = fix_name_openers(text, target_pct=opener_target)
+
+    # 4.4: Impact paragraph isolation
     text, impact_pct, impacts_split = isolate_impact_paragraphs(text)
 
-    # ---- STAGE 4.5: PARAGRAPH SPLITTER ----
-    text, para_splits = split_long_paragraphs(text, max_words=50)
+    # 4.5: Paragraph splitter (target from baseline)
+    para_max = max(int(baseline_para * 2.5), 60)
+    text, para_splits = split_long_paragraphs(text, max_words=para_max)
 
-    # ---- Compute metrics once ----
+    # ---- Compute metrics ----
     metrics = compute_chapter_metrics(text)
 
     # ---- STAGE 5: QUALITY GATE ----
@@ -802,9 +732,11 @@ Output ONLY the rewritten chapter. No commentary."""
         "voice_delta": voice_delta,
         "hotspots": hotspots,
         "manifest": {
-            "pipeline_version": "web-v3.1",
+            "pipeline_version": "web-v4",
             "scene_type": scene_type,
-            "stages": ["draft", "rewrite", "em_dash_removal", "smoothing_removal",
+            "stages": ["draft", "rewrite",
+                       "em_dash_removal" if baseline_em < 1 else "em_dash_kept",
+                       "smoothing_removal" if baseline_smooth < 0.5 else "smoothing_kept",
                        "opener_fix", "impact_isolation", "paragraph_split",
                        "quality_gate", "voice_delta"],
             "model": "claude-sonnet-4-20250514",
